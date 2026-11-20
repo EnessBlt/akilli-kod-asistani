@@ -1,4 +1,5 @@
 import json
+import time
 import urllib.error
 import urllib.request
 import streamlit as st
@@ -22,7 +23,7 @@ st.markdown(
         border: 1px solid #2A3F6E;
         border-radius: 16px;
         padding: 20px 24px;
-        margin-bottom: 20px;
+        margin-bottom: 14px;
     }
     .hero-title {
         font-size: 28px;
@@ -37,6 +38,28 @@ st.markdown(
         font-size: 14px;
         margin-top: 6px;
         margin-bottom: 0;
+    }
+    .api-link-box {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 8px;
+        background-color: rgba(14, 27, 43, 0.85);
+        border: 1px solid #1E4E68;
+        border-radius: 12px;
+        padding: 10px 14px;
+        margin-bottom: 18px;
+        font-size: 13px;
+        color: #CBD5E1;
+    }
+    .api-link-box a {
+        color: #38BDF8;
+        font-weight: 700;
+        text-decoration: none;
+    }
+    .api-link-box a:hover {
+        text-decoration: underline;
     }
     div.stButton > button:first-child {
         background: linear-gradient(90deg, #A855F7, #3B82F6, #06B6D4, #10B981);
@@ -81,15 +104,18 @@ st.markdown(
         <p class="hero-title">Akıllı Kod Asistanı & Konu Özetleyici</p>
         <p class="hero-sub">Yapay Zeka Destekli Kod Analizi, Hata Ayıklama ve Metin Özetleme Aracı</p>
     </div>
+    <div class="api-link-box">
+        <span>🔑 API anahtarınız yok mu? Google hesabınızla ücretsiz oluşturabilirsiniz:</span>
+        <a href="https://aistudio.google.com/apikey" target="_blank">Ücretsiz API Anahtarı Al (Google AI Studio) ↗</a>
+    </div>
     """,
     unsafe_allow_html=True,
 )
 
 MODELS = {
-    "Gemini 3.8 Flash (Hızlı & Güncel - Önerilen)": "gemini-3.8-flash",
-    "Gemini 3.8 Pro (Gelişmiş Kodlama & Analiz)": "gemini-3.8-pro",
-    "Gemini 2.5 Flash (Klasik Hızlı)": "gemini-2.5-flash",
-    "Gemini 2.5 Pro (Klasik Pro)": "gemini-2.5-pro",
+    "Otomatik (En Uygun Aktif Modeli Seç - Önerilen)": "auto",
+    "Gemini 3.8 Flash (Hızlı & Güncel)": "gemini-3.8-flash",
+    "Gemini 3.8 Flash Lite (Düşük Yoğunluk)": "gemini-3.8-flash-lite",
 }
 
 MODES = {
@@ -107,28 +133,93 @@ MODES = {
     ),
 }
 
+EXCLUDED_KEYWORDS = ("tts", "image", "audio", "robotics", "computer-use", "embedding", "aqa", "banana")
 
-def call_gemini(api_key: str, model: str, system_prompt: str, user_text: str) -> str:
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-    payload = {
-        "system_instruction": {"parts": [{"text": system_prompt}]},
-        "contents": [{"parts": [{"text": user_text}]}],
-    }
+
+def get_available_models(api_key: str) -> list[str]:
+    """API anahtarının erişebildiği metin/kod tabanlı Gemini modellerini Google'dan çeker."""
     req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
+        "https://generativelanguage.googleapis.com/v1beta/models",
+        headers={"x-goog-api-key": api_key},
+        method="GET",
     )
     try:
-        with urllib.request.urlopen(req, timeout=45) as resp:
+        with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-            return data["candidates"][0]["content"]["parts"][0]["text"]
-    except urllib.error.HTTPError as e:
-        err_msg = e.read().decode("utf-8", errors="ignore")
-        raise RuntimeError(f"API Hatası ({e.code}): {err_msg}")
-    except Exception as e:
-        raise RuntimeError(f"Bağlantı hatası: {e}")
+            valid = []
+            for m in data.get("models", []):
+                methods = m.get("supportedGenerationMethods", [])
+                name = m.get("name", "").replace("models/", "")
+                if (
+                    "generateContent" in methods
+                    and "gemini" in name
+                    and not any(bad in name.lower() for bad in EXCLUDED_KEYWORDS)
+                ):
+                    valid.append(name)
+            valid.sort(key=lambda x: (0 if "flash" in x else 1, x))
+            if valid:
+                return valid
+    except Exception:
+        pass
+    return ["gemini-3.8-flash", "gemini-3.8-flash-lite"]
+
+
+def call_gemini(api_key: str, primary_model: str, system_prompt: str, user_text: str, status_box) -> tuple[str, str]:
+    available = get_available_models(api_key)
+    if primary_model == "auto" or not primary_model:
+        models_to_try = available
+    else:
+        models_to_try = [primary_model] + [m for m in available if m != primary_model]
+
+    if not models_to_try:
+        models_to_try = ["gemini-3.8-flash"]
+
+    payload = {
+        "system_instruction": {"parts": [{"text": system_prompt}]},
+        "contents": [{"role": "user", "parts": [{"text": user_text}]}],
+        "generationConfig": {"temperature": 0.35},
+    }
+    encoded_payload = json.dumps(payload).encode("utf-8")
+    last_error = "Sunucudan yanıt alınamadı."
+
+    for index, model_name in enumerate(models_to_try):
+        if index > 0:
+            status_box.info(f"Seçili model yoğun veya uyumsuz, alternatif model deneniyor: **{model_name}**...")
+            time.sleep(1.0)
+
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
+        req = urllib.request.Request(
+            url,
+            data=encoded_payload,
+            headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": api_key,
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                candidates = data.get("candidates", [])
+                parts = candidates[0].get("content", {}).get("parts", []) if candidates else []
+                answer = "\n\n".join(part.get("text", "") for part in parts if part.get("text"))
+                if not answer:
+                    raise RuntimeError("Model yanıtı boş döndü.")
+                return answer, model_name
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode("utf-8", errors="ignore")
+            try:
+                err_json = json.loads(err_body)
+                msg = err_json.get("error", {}).get("message", err_body)
+            except Exception:
+                msg = err_body
+            last_error = f"API Hatası ({e.code}): {msg}"
+            if e.code in (401, 403):
+                raise RuntimeError(last_error)
+        except Exception as e:
+            last_error = f"Bağlantı hatası: {e}"
+
+    raise RuntimeError(last_error)
 
 
 # Ayarlar Bölümü
@@ -137,7 +228,7 @@ with col1:
     api_key = st.text_input(
         "Gemini API Anahtarı",
         type="password",
-        placeholder="AIzaSy...",
+        placeholder="AQ.Ab8... veya AIzaSy...",
         help="Anahtar yalnızca bu oturumda bellekte tutulur.",
     )
 with col2:
@@ -153,22 +244,26 @@ user_input = st.text_area(
 
 if st.button("✨ Analiz Et / Oluştur"):
     if not api_key.strip():
-        st.warning("Lütfen AIzaSy... ile başlayan Gemini API anahtarınızı girin.")
+        st.warning("Lütfen AQ.Ab8... veya AIzaSy... ile başlayan Gemini API anahtarınızı girin.")
     elif not user_input.strip():
         st.warning("Lütfen özetlenecek metni veya analiz edilecek kodu yapıştırın.")
     else:
         model_id = MODELS[selected_model_label]
-        with st.spinner(f"{selected_model_label} yanıt hazırlıyor..."):
+        status_placeholder = st.empty()
+        with st.spinner("Uygun model belirleniyor ve yanıt hazırlanıyor..."):
             try:
-                result = call_gemini(
+                result, used_model = call_gemini(
                     api_key.strip(),
                     model_id,
                     MODES[selected_mode],
                     user_input.strip(),
+                    status_placeholder,
                 )
-                st.success(f"Tamamlandı · Kullanılan Model: {model_id}")
+                status_placeholder.empty()
+                st.success(f"Tamamlandı · Kullanılan Model: {used_model}")
                 st.markdown('<div class="output-card">', unsafe_allow_html=True)
                 st.markdown(result)
                 st.markdown("</div>", unsafe_allow_html=True)
             except Exception as ex:
+                status_placeholder.empty()
                 st.error(str(ex))
